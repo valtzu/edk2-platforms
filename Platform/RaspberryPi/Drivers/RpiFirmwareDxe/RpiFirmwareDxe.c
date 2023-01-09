@@ -340,7 +340,7 @@ RpiFirmwareGetMacAddress (
   return EFI_SUCCESS;
 }
 
-#pragma pack()
+#pragma pack(1)
 typedef struct {
   UINT64                    Serial;
 } RPI_FW_SERIAL_TAG;
