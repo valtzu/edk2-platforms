@@ -38,6 +38,12 @@
 
 #define RPI_MBOX_VALUE_SIZE_RESPONSE_MASK                     BIT31
 
+/*
+ * The crypto tags do not fail the mailbox transaction when an operation is
+ * rejected; they set this bit in their own response status word instead.
+ */
+#define RPI_MBOX_CRYPTO_ERROR                                 BIT31
+
 #define RPI_MBOX_GET_REVISION                                 0x00000001
 #define RPI_MBOX_GET_BOARD_MODEL                              0x00010001
 #define RPI_MBOX_GET_BOARD_REVISION                           0x00010002
@@ -93,6 +99,10 @@
 #define RPI_MBOX_GET_POE_HAT_VAL                              0x00030049
 #define RPI_MBOX_SET_POE_HAT_VAL                              0x00030050
 #define RPI_MBOX_NOTIFY_XHCI_RESET                            0x00030058
+#define RPI_MBOX_GET_CRYPTO_LAST_ERROR                        0x0003008e
+#define RPI_MBOX_GET_CRYPTO_KEY_STATUS                        0x00030090
+#define RPI_MBOX_GET_CRYPTO_GEN_ECDSA_KEY                     0x00030095
+#define RPI_MBOX_GET_CRYPTO_HMAC_SHA256                       0x00030092
 
 #define RPI_MBOX_SET_CLOCK_STATE                              0x00038001
 #define RPI_MBOX_SET_CLOCK_RATE                               0x00038002
@@ -104,6 +114,7 @@
 #define RPI_MBOX_SET_SDHOST_CLOCK                             0x00038042
 #define RPI_MBOX_SET_GPIO_CONFIG                              0x00038043
 #define RPI_MBOX_SET_PERIPH_REG                               0x00038045
+#define RPI_MBOX_SET_CRYPTO_KEY_STATUS                        0x00038090
 
 #define RPI_MBOX_ALLOC_FB                                     0x00040001
 #define RPI_MBOX_FB_BLANK                                     0x00040002

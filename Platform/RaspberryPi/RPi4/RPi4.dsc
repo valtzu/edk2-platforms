@@ -748,6 +748,21 @@
   Silicon/Broadcom/Bcm283x/Drivers/Bcm2838RngDxe/Bcm2838RngDxe.inf
 
   #
+  # OTP-derived LoaderBootSecret (systemd-boot TPM-less boot secret).
+  # Inert unless the EnableOtpDerivedLoaderBootSecret variable is set, signed
+  # boot is enforced in OTP and Secure Boot is on. It then asks the firmware to
+  # HMAC with the device private key -- generating that key in OTP first, one
+  # time, if the slot is still blank -- and locks the key at ExitBootServices()
+  # so the OS cannot repeat the derivation. No key material ever crosses the
+  # mailbox. Only built with SECURE_BOOT_ENABLE, since without image
+  # verification there is nothing to keep the secret from being handed to an
+  # unverified loader.
+  #
+!if $(SECURE_BOOT_ENABLE) == TRUE
+  Platform/RaspberryPi/Drivers/LoaderBootSecretDxe/LoaderBootSecretDxe.inf
+!endif
+
+  #
   # PCI Support
   #
   ArmPkg/Drivers/ArmPciCpuIo2Dxe/ArmPciCpuIo2Dxe.inf

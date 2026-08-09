@@ -281,6 +281,14 @@ READ_LOCK_STATUS   = TRUE
   INF Silicon/Broadcom/Bcm283x/Drivers/Bcm2838RngDxe/Bcm2838RngDxe.inf
 
   #
+  # OTP-derived LoaderBootSecret (systemd-boot TPM-less boot secret).
+  # See the matching note in RPi4.dsc.
+  #
+!if $(SECURE_BOOT_ENABLE) == TRUE
+  INF Platform/RaspberryPi/Drivers/LoaderBootSecretDxe/LoaderBootSecretDxe.inf
+!endif
+
+  #
   # PCI Support
   #
   INF ArmPkg/Drivers/ArmPciCpuIo2Dxe/ArmPciCpuIo2Dxe.inf

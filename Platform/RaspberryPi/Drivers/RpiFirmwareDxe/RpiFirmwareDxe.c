@@ -254,7 +254,94 @@ typedef struct {
   RPI_FW_GPIO_SET_CFG_TAG      TagBody;
   UINT32                       EndTag;
 } RPI_FW_NOTIFY_GPIO_SET_CFG_CMD;
+
+//
+// The firmware crypto tags overlay the response on top of the request, and the
+// tag buffer has to be large enough for whichever of the two is bigger. The
+// reference implementation (rpifwcrypto.c) always passes the full maximum
+// message buffer, so do the same rather than guess how much the firmware is
+// willing to see.
+//
+typedef union {
+  struct {
+    UINT32                     Flags;
+    UINT32                     KeyId;
+    UINT32                     Length;
+    UINT8                      Message[RPI_FW_CRYPTO_HMAC_MSG_MAX_SIZE];
+  } Req;
+  struct {
+    UINT32                     Status;
+    UINT32                     Length;
+    UINT8                      Hmac[RPI_FW_CRYPTO_HMAC_SIZE];
+  } Resp;
+} RPI_FW_CRYPTO_HMAC_TAG;
+
+typedef struct {
+  RPI_FW_BUFFER_HEAD           BufferHead;
+  RPI_FW_TAG_HEAD              TagHead;
+  RPI_FW_CRYPTO_HMAC_TAG       TagBody;
+  UINT32                       EndTag;
+} RPI_FW_CRYPTO_HMAC_CMD;
+
+typedef union {
+  struct {
+    UINT32                     Flags;
+    UINT32                     KeyId;
+  } Req;
+  struct {
+    UINT32                     Status;
+  } Resp;
+} RPI_FW_CRYPTO_GEN_ECDSA_KEY_TAG;
+
+typedef struct {
+  RPI_FW_BUFFER_HEAD           BufferHead;
+  RPI_FW_TAG_HEAD              TagHead;
+  RPI_FW_CRYPTO_GEN_ECDSA_KEY_TAG  TagBody;
+  UINT32                       EndTag;
+} RPI_FW_CRYPTO_GEN_ECDSA_KEY_CMD;
+
+typedef struct {
+  //
+  // KeyId on the way in, the key's status word on the way out.
+  //
+  UINT32                       Value;
+} RPI_FW_CRYPTO_GET_KEY_STATUS_TAG;
+
+typedef struct {
+  RPI_FW_BUFFER_HEAD           BufferHead;
+  RPI_FW_TAG_HEAD              TagHead;
+  RPI_FW_CRYPTO_GET_KEY_STATUS_TAG  TagBody;
+  UINT32                       EndTag;
+} RPI_FW_CRYPTO_GET_KEY_STATUS_CMD;
+
+typedef struct {
+  UINT32                       KeyId;
+  UINT32                       KeyStatus;
+} RPI_FW_CRYPTO_SET_KEY_STATUS_TAG;
+
+typedef struct {
+  RPI_FW_BUFFER_HEAD           BufferHead;
+  RPI_FW_TAG_HEAD              TagHead;
+  RPI_FW_CRYPTO_SET_KEY_STATUS_TAG  TagBody;
+  UINT32                       EndTag;
+} RPI_FW_CRYPTO_SET_KEY_STATUS_CMD;
+
+typedef struct {
+  UINT32                       Error;
+} RPI_FW_CRYPTO_LAST_ERROR_TAG;
+
+typedef struct {
+  RPI_FW_BUFFER_HEAD           BufferHead;
+  RPI_FW_TAG_HEAD              TagHead;
+  RPI_FW_CRYPTO_LAST_ERROR_TAG TagBody;
+  UINT32                       EndTag;
+} RPI_FW_CRYPTO_LAST_ERROR_CMD;
 #pragma pack()
+
+STATIC_ASSERT (
+  sizeof (RPI_FW_CRYPTO_HMAC_CMD) <= EFI_PAGES_TO_SIZE (NUM_PAGES),
+  "The crypto HMAC command must fit in the mailbox DMA buffer"
+  );
 
 STATIC VOID  *mDmaBuffer;
 STATIC VOID  *mDmaBufferMapping;
@@ -1504,6 +1591,287 @@ RpiFirmwareNotifyGpioSetCfg (
   return Status;
 }
 
+STATIC
+EFI_STATUS
+EFIAPI
+RpiFirmwareCryptoHmacSha256 (
+  IN  UINT32       Flags,
+  IN  UINT32       KeyId,
+  IN  CONST UINT8  *Message,
+  IN  UINTN        MessageSize,
+  OUT UINT8        *Hmac
+  )
+{
+  RPI_FW_CRYPTO_HMAC_CMD  *Cmd;
+  EFI_STATUS              Status;
+  UINT32                  Result;
+
+  if (Message == NULL || Hmac == NULL || MessageSize == 0 ||
+      MessageSize > RPI_FW_CRYPTO_HMAC_MSG_MAX_SIZE) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (!AcquireSpinLockOrFail (&mMailboxLock)) {
+    DEBUG ((DEBUG_ERROR, "%a: failed to acquire spinlock\n", __func__));
+    return EFI_DEVICE_ERROR;
+  }
+
+  Cmd = mDmaBuffer;
+  ZeroMem (Cmd, sizeof (*Cmd));
+
+  Cmd->BufferHead.BufferSize  = sizeof (*Cmd);
+  Cmd->BufferHead.Response    = 0;
+  Cmd->TagHead.TagId          = RPI_MBOX_GET_CRYPTO_HMAC_SHA256;
+  Cmd->TagHead.TagSize        = sizeof (Cmd->TagBody);
+  Cmd->TagHead.TagValueSize   = 0;
+  Cmd->TagBody.Req.Flags      = Flags;
+  Cmd->TagBody.Req.KeyId      = KeyId;
+  Cmd->TagBody.Req.Length     = (UINT32)MessageSize;
+  CopyMem (Cmd->TagBody.Req.Message, Message, MessageSize);
+  Cmd->EndTag                 = 0;
+
+  Status = MailboxTransaction (Cmd->BufferHead.BufferSize, RPI_MBOX_VC_CHANNEL, &Result);
+
+  if (EFI_ERROR (Status) ||
+      Cmd->BufferHead.Response != RPI_MBOX_RESP_SUCCESS) {
+    DEBUG ((DEBUG_ERROR,
+      "%a: mailbox transaction error: Status == %r, Response == 0x%x\n",
+      __func__, Status, Cmd->BufferHead.Response));
+    ZeroMem (Cmd, sizeof (*Cmd));
+    ReleaseSpinLock (&mMailboxLock);
+    return EFI_DEVICE_ERROR;
+  }
+
+  //
+  // The crypto tags report their own failures in the response status word
+  // rather than by failing the mailbox transaction. Use GetCryptoLastError()
+  // for the reason.
+  //
+  if ((Cmd->TagBody.Resp.Status & RPI_MBOX_CRYPTO_ERROR) != 0) {
+    DEBUG ((DEBUG_ERROR, "%a: firmware refused the HMAC request for key %u\n",
+      __func__, KeyId));
+    ZeroMem (Cmd, sizeof (*Cmd));
+    ReleaseSpinLock (&mMailboxLock);
+    return EFI_DEVICE_ERROR;
+  }
+
+  CopyMem (Hmac, Cmd->TagBody.Resp.Hmac, RPI_FW_CRYPTO_HMAC_SIZE);
+
+  //
+  // mDmaBuffer is a page of EfiBootServicesData shared with the VideoCore and
+  // reclaimed by the OS after ExitBootServices(). This command is larger than
+  // most, so a later, smaller command would not overwrite the digest: wipe it
+  // here rather than leave a key-derived secret sitting in that page.
+  //
+  ZeroMem (Cmd, sizeof (*Cmd));
+  ReleaseSpinLock (&mMailboxLock);
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+RpiFirmwareCryptoGenEcdsaKey (
+  IN  UINT32    Flags,
+  IN  UINT32    KeyId
+  )
+{
+  RPI_FW_CRYPTO_GEN_ECDSA_KEY_CMD  *Cmd;
+  EFI_STATUS                       Status;
+  UINT32                           Result;
+
+  if (!AcquireSpinLockOrFail (&mMailboxLock)) {
+    DEBUG ((DEBUG_ERROR, "%a: failed to acquire spinlock\n", __func__));
+    return EFI_DEVICE_ERROR;
+  }
+
+  Cmd = mDmaBuffer;
+  ZeroMem (Cmd, sizeof (*Cmd));
+
+  Cmd->BufferHead.BufferSize  = sizeof (*Cmd);
+  Cmd->BufferHead.Response    = 0;
+  Cmd->TagHead.TagId          = RPI_MBOX_GET_CRYPTO_GEN_ECDSA_KEY;
+  Cmd->TagHead.TagSize        = sizeof (Cmd->TagBody);
+  Cmd->TagHead.TagValueSize   = 0;
+  Cmd->TagBody.Req.Flags      = Flags;
+  Cmd->TagBody.Req.KeyId      = KeyId;
+  Cmd->EndTag                 = 0;
+
+  //
+  // NOTE: this burns OTP. It is one-time and irreversible, and the firmware
+  // only permits it on a blank, unlocked key slot.
+  //
+  Status = MailboxTransaction (Cmd->BufferHead.BufferSize, RPI_MBOX_VC_CHANNEL, &Result);
+
+  if (EFI_ERROR (Status) ||
+      Cmd->BufferHead.Response != RPI_MBOX_RESP_SUCCESS) {
+    DEBUG ((DEBUG_ERROR,
+      "%a: mailbox transaction error: Status == %r, Response == 0x%x\n",
+      __func__, Status, Cmd->BufferHead.Response));
+    ReleaseSpinLock (&mMailboxLock);
+    return EFI_DEVICE_ERROR;
+  }
+
+  if ((Cmd->TagBody.Resp.Status & RPI_MBOX_CRYPTO_ERROR) != 0) {
+    DEBUG ((DEBUG_ERROR, "%a: firmware refused to generate a key in slot %u\n",
+      __func__, KeyId));
+    ReleaseSpinLock (&mMailboxLock);
+    return EFI_DEVICE_ERROR;
+  }
+
+  ReleaseSpinLock (&mMailboxLock);
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+RpiFirmwareGetCryptoKeyStatus (
+  IN  UINT32    KeyId,
+  OUT UINT32    *KeyStatus
+  )
+{
+  RPI_FW_CRYPTO_GET_KEY_STATUS_CMD  *Cmd;
+  EFI_STATUS                        Status;
+  UINT32                            Result;
+
+  if (KeyStatus == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (!AcquireSpinLockOrFail (&mMailboxLock)) {
+    DEBUG ((DEBUG_ERROR, "%a: failed to acquire spinlock\n", __func__));
+    return EFI_DEVICE_ERROR;
+  }
+
+  Cmd = mDmaBuffer;
+  ZeroMem (Cmd, sizeof (*Cmd));
+
+  Cmd->BufferHead.BufferSize  = sizeof (*Cmd);
+  Cmd->BufferHead.Response    = 0;
+  Cmd->TagHead.TagId          = RPI_MBOX_GET_CRYPTO_KEY_STATUS;
+  Cmd->TagHead.TagSize        = sizeof (Cmd->TagBody);
+  Cmd->TagHead.TagValueSize   = 0;
+  Cmd->TagBody.Value          = KeyId;
+  Cmd->EndTag                 = 0;
+
+  Status = MailboxTransaction (Cmd->BufferHead.BufferSize, RPI_MBOX_VC_CHANNEL, &Result);
+
+  if (EFI_ERROR (Status) ||
+      Cmd->BufferHead.Response != RPI_MBOX_RESP_SUCCESS) {
+    DEBUG ((DEBUG_ERROR,
+      "%a: mailbox transaction error: Status == %r, Response == 0x%x\n",
+      __func__, Status, Cmd->BufferHead.Response));
+    ReleaseSpinLock (&mMailboxLock);
+    return EFI_DEVICE_ERROR;
+  }
+
+  if ((Cmd->TagBody.Value & RPI_MBOX_CRYPTO_ERROR) != 0) {
+    DEBUG ((DEBUG_ERROR, "%a: no status for key %u\n", __func__, KeyId));
+    ReleaseSpinLock (&mMailboxLock);
+    return EFI_NOT_FOUND;
+  }
+
+  *KeyStatus = Cmd->TagBody.Value;
+  ReleaseSpinLock (&mMailboxLock);
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+RpiFirmwareSetCryptoKeyStatus (
+  IN  UINT32    KeyId,
+  IN  UINT32    KeyStatus
+  )
+{
+  RPI_FW_CRYPTO_SET_KEY_STATUS_CMD  *Cmd;
+  EFI_STATUS                        Status;
+  UINT32                            Result;
+
+  if (!AcquireSpinLockOrFail (&mMailboxLock)) {
+    DEBUG ((DEBUG_ERROR, "%a: failed to acquire spinlock\n", __func__));
+    return EFI_DEVICE_ERROR;
+  }
+
+  Cmd = mDmaBuffer;
+  ZeroMem (Cmd, sizeof (*Cmd));
+
+  Cmd->BufferHead.BufferSize  = sizeof (*Cmd);
+  Cmd->BufferHead.Response    = 0;
+  Cmd->TagHead.TagId          = RPI_MBOX_SET_CRYPTO_KEY_STATUS;
+  Cmd->TagHead.TagSize        = sizeof (Cmd->TagBody);
+  Cmd->TagHead.TagValueSize   = 0;
+  Cmd->TagBody.KeyId          = KeyId;
+  Cmd->TagBody.KeyStatus      = KeyStatus;
+  Cmd->EndTag                 = 0;
+
+  Status = MailboxTransaction (Cmd->BufferHead.BufferSize, RPI_MBOX_VC_CHANNEL, &Result);
+
+  if (EFI_ERROR (Status) ||
+      Cmd->BufferHead.Response != RPI_MBOX_RESP_SUCCESS) {
+    DEBUG ((DEBUG_ERROR,
+      "%a: mailbox transaction error: Status == %r, Response == 0x%x\n",
+      __func__, Status, Cmd->BufferHead.Response));
+    ReleaseSpinLock (&mMailboxLock);
+    return EFI_DEVICE_ERROR;
+  }
+
+  ReleaseSpinLock (&mMailboxLock);
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+RpiFirmwareGetCryptoLastError (
+  OUT UINT32    *Error
+  )
+{
+  RPI_FW_CRYPTO_LAST_ERROR_CMD  *Cmd;
+  EFI_STATUS                    Status;
+  UINT32                        Result;
+
+  if (Error == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (!AcquireSpinLockOrFail (&mMailboxLock)) {
+    DEBUG ((DEBUG_ERROR, "%a: failed to acquire spinlock\n", __func__));
+    return EFI_DEVICE_ERROR;
+  }
+
+  Cmd = mDmaBuffer;
+  ZeroMem (Cmd, sizeof (*Cmd));
+
+  Cmd->BufferHead.BufferSize  = sizeof (*Cmd);
+  Cmd->BufferHead.Response    = 0;
+  Cmd->TagHead.TagId          = RPI_MBOX_GET_CRYPTO_LAST_ERROR;
+  Cmd->TagHead.TagSize        = sizeof (Cmd->TagBody);
+  Cmd->TagHead.TagValueSize   = 0;
+  Cmd->EndTag                 = 0;
+
+  Status = MailboxTransaction (Cmd->BufferHead.BufferSize, RPI_MBOX_VC_CHANNEL, &Result);
+
+  if (EFI_ERROR (Status) ||
+      Cmd->BufferHead.Response != RPI_MBOX_RESP_SUCCESS) {
+    DEBUG ((DEBUG_ERROR,
+      "%a: mailbox transaction error: Status == %r, Response == 0x%x\n",
+      __func__, Status, Cmd->BufferHead.Response));
+    ReleaseSpinLock (&mMailboxLock);
+    return EFI_DEVICE_ERROR;
+  }
+
+  *Error = Cmd->TagBody.Error;
+  ReleaseSpinLock (&mMailboxLock);
+
+  return EFI_SUCCESS;
+}
+
 STATIC RASPBERRY_PI_FIRMWARE_PROTOCOL mRpiFirmwareProtocol = {
   RpiFirmwareSetPowerState,
   RpiFirmwareGetMacAddress,
@@ -1529,7 +1897,12 @@ STATIC RASPBERRY_PI_FIRMWARE_PROTOCOL mRpiFirmwareProtocol = {
   RpiFirmwareNotifyXhciReset,
   RpiFirmwareGetCurrentClockState,
   RpiFirmwareSetClockState,
-  RpiFirmwareNotifyGpioSetCfg
+  RpiFirmwareNotifyGpioSetCfg,
+  RpiFirmwareCryptoHmacSha256,
+  RpiFirmwareCryptoGenEcdsaKey,
+  RpiFirmwareGetCryptoKeyStatus,
+  RpiFirmwareSetCryptoKeyStatus,
+  RpiFirmwareGetCryptoLastError
 };
 
 /**
