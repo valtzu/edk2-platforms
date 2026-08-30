@@ -31,7 +31,6 @@
 //
 #define NUM_PAGES   1
 
-#pragma pack(1)
 typedef struct {
   UINT32    BufferSize;
   UINT32    Response;
@@ -69,7 +68,6 @@ typedef struct {
 
 typedef struct {
   UINT8                     MacAddress[6];
-  UINT32                    Padding;
 } RPI_FW_MAC_ADDR_TAG;
 
 typedef struct {
@@ -80,7 +78,7 @@ typedef struct {
 } RPI_FW_GET_MAC_ADDR_CMD;
 
 typedef struct {
-  UINT64                    Serial;
+  UINT32                    Serial[2];
 } RPI_FW_SERIAL_TAG;
 
 typedef struct {
@@ -254,7 +252,6 @@ typedef struct {
   RPI_FW_GPIO_SET_CFG_TAG      TagBody;
   UINT32                       EndTag;
 } RPI_FW_NOTIFY_GPIO_SET_CFG_CMD;
-#pragma pack()
 
 STATIC VOID  *mDmaBuffer;
 STATIC VOID  *mDmaBufferMapping;
@@ -549,7 +546,7 @@ RpiFirmwareGetSerial (
     return EFI_DEVICE_ERROR;
   }
 
-  *Serial = Cmd->TagBody.Serial;
+  CopyMem (Serial, Cmd->TagBody.Serial, sizeof (*Serial));
   ReleaseSpinLock (&mMailboxLock);
   // Some platforms return 0 or 0x0000000010000000 for serial.
   // For those, try to use the MAC address.
